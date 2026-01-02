@@ -1,0 +1,489 @@
+{"timestamp": "2025-01-01T10:00:01", "src_ip": "203.0.113.50", "dst_ip": "10.0.0.5", "username": "john", "event_type": "AUTH", "status": "FAIL", "asset": "VPN-GATEWAY", "process_hash": null, "domain": null}
+{"timestamp": "2025-01-01T10:00:05", "src_ip": "203.0.113.50", "dst_ip": "10.0.0.5", "username": "john", "event_type": "AUTH", "status": "SUCCESS", "asset": "VPN-GATEWAY", "process_hash": "abcd1234", "domain": null}
+{"timestamp": "2025-01-01T10:02:00", "src_ip": "192.168.1.10", "dst_ip": "10.0.0.20", "username": "svc_backup", "event_type": "PROCESS_START", "status": "OK", "asset": "AD-SERVER", "process_hash": "deadbeef", "domain": "evil.example.com"}
+{"timestamp": "2025-01-01T10:03:00", "src_ip": "198.51.100.23", "dst_ip": "10.0.0.30", "username": "admin", "event_type": "AUTH", "status": "FAIL", "asset": "VPN-GATEWAY", "process_hash": null, "domain": null}
+{"timestamp": "2025-01-01T10:03:30", "src_ip": "198.51.100.23", "dst_ip": "10.0.0.30", "username": "admin", "event_type": "AUTH", "status": "FAIL", "asset": "VPN-GATEWAY", "process_hash": null, "domain": null}
+{"timestamp": "2025-01-01T10:03:55", "src_ip": "198.51.100.23", "dst_ip": "10.0.0.30", "username": "admin", "event_type": "AUTH", "status": "FAIL", "asset": "VPN-GATEWAY", "process_hash": null, "domain": null}
+import json
+from datetime import datetime, timedelta
+from collections import defaultdict, Counter
+
+# ============================================================
+# MILITARY-STYLE THREAT AUTOMATION ANALYZER
+# ------------------------------------------------------------
+# Capabilities:
+# - Ingests JSONL events from a log file
+# - Matches events against simulated threat intel (IPs, domains, hashes)
+# - Scores risk based on:
+#     * IOC type (IP/domain/hash)
+#     * Confidence level of intel source
+#     * Intel recency
+#     * Asset criticality
+#     * User sensitivity (admin/service)
+# - Groups related events into incidents
+# - Suggests automated response actions (playbook-style)
+# - Outputs:
+#     * Human-readable incident report
+#     * JSON report for further automation
+#
+# Designed to look like something a SOC Lead / military
+# cyber defense officer might design as a prototype
+# for an automated threat assessment pipeline.
+# ============================================================
+
+TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
+
+# -----------------------------
+# Simulated Threat Intelligence
+# -----------------------------
+# In a real system, these would be pulled from:
+# - Government feeds
+# - Commercial feeds
+# - Internal intel
+# Here we simulate a merge of multiple sources.
+THREAT_INTEL = {
+    "ips": {
+        "203.0.113.50": {
+            "indicator_type": "ip",
+            "threat_type": "C2",
+            "confidence": 0.95,
+            "first_seen": "2024-12-01T00:00:00",
+            "last_seen": "2025-01-01T00:00:00",
+            "sources": ["NationalFeed-A", "Coalition-Partner-1"],
+        },
+        "198.51.100.23": {
+            "indicator_type": "ip",
+            "threat_type": "brute_force",
+            "confidence": 0.85,
+            "first_seen": "2024-11-15T00:00:00",
+            "last_seen": "2024-12-28T00:00:00",
+            "sources": ["CommercialFeed-X"],
+        },
+    },
+    "domains": {
+        "evil.example.com": {
+            "indicator_type": "domain",
+            "threat_type": "malware_hosting",
+            "confidence": 0.9,
+            "first_seen": "2024-12-20T00:00:00",
+            "last_seen": "2024-12-31T00:00:00",
+            "sources": ["NationalFeed-B"],
+        }
+    },
+    "hashes": {
+        "deadbeef": {
+            "indicator_type": "hash",
+            "threat_type": "ransomware",
+            "confidence": 0.98,
+            "first_seen": "2024-10-01T00:00:00",
+            "last_seen": "2024-12-15T00:00:00",
+            "sources": ["MalwareLab-Internal"],
+        },
+        "abcd1234": {
+            "indicator_type": "hash",
+            "threat_type": "credential_stealer",
+            "confidence": 0.88,
+            "first_seen": "2024-11-10T00:00:00",
+            "last_seen": "2024-12-30T00:00:00",
+            "sources": ["CommercialFeed-Y", "NationalFeed-C"],
+        },
+    },
+}
+
+# Asset criticality ratings (simulated)
+ASSET_CRITICALITY = {
+    "VPN-GATEWAY": 0.9,
+    "AD-SERVER": 1.0,
+    "FILE-SERVER": 0.8,
+    "WEB-SERVER": 0.7,
+}
+
+# Users considered high value
+HIGH_VALUE_USERS = {"admin", "root", "svc_backup", "svc_krbtgt"}
+
+# -----------------------------
+# Event Model
+# -----------------------------
+class Event:
+    def __init__(self, raw, idx):
+        self.raw = raw  # original JSON object
+        self.idx = idx  # event sequence number
+        self.timestamp = self._parse_time(raw.get("timestamp"))
+        self.src_ip = raw.get("src_ip")
+        self.dst_ip = raw.get("dst_ip")
+        self.username = raw.get("username")
+        self.event_type = raw.get("event_type")
+        self.status = raw.get("status")
+        self.asset = raw.get("asset")
+        self.process_hash = raw.get("process_hash")
+        self.domain = raw.get("domain")
+
+        self.matches = []  # list of IOC matches
+        self.base_risk = 0.0
+
+    def _parse_time(self, ts):
+        try:
+            return datetime.strptime(ts, TIME_FORMAT)
+        except Exception:
+            return None
+
+    def to_dict(self):
+        return {
+            "idx": self.idx,
+            "timestamp": self.timestamp.strftime(TIME_FORMAT) if self.timestamp else None,
+            "src_ip": self.src_ip,
+            "dst_ip": self.dst_ip,
+            "username": self.username,
+            "event_type": self.event_type,
+            "status": self.status,
+            "asset": self.asset,
+            "process_hash": self.process_hash,
+            "domain": self.domain,
+            "matches": self.matches,
+            "base_risk": self.base_risk,
+        }
+
+# -----------------------------
+# Loader
+# -----------------------------
+def load_events(path):
+    events = []
+    try:
+        with open(path, "r") as f:
+            for idx, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    events.append(Event(obj, idx))
+                except json.JSONDecodeError:
+                    print(f"Skipping invalid JSON on line {idx}")
+    except FileNotFoundError:
+        print("Error: Event file not found.")
+    return events
+
+# -----------------------------
+# Threat Intel Matching
+# -----------------------------
+def match_threat_intel(event):
+    matches = []
+
+    # IP match
+    if event.src_ip and event.src_ip in THREAT_INTEL["ips"]:
+        ioc = THREAT_INTEL["ips"][event.src_ip]
+        matches.append({
+            "indicator": event.src_ip,
+            "indicator_type": "ip",
+            "threat_type": ioc["threat_type"],
+            "confidence": ioc["confidence"],
+            "first_seen": ioc["first_seen"],
+            "last_seen": ioc["last_seen"],
+            "sources": ioc["sources"],
+        })
+
+    # Domain match
+    if event.domain and event.domain in THREAT_INTEL["domains"]:
+        ioc = THREAT_INTEL["domains"][event.domain]
+        matches.append({
+            "indicator": event.domain,
+            "indicator_type": "domain",
+            "threat_type": ioc["threat_type"],
+            "confidence": ioc["confidence"],
+            "first_seen": ioc["first_seen"],
+            "last_seen": ioc["last_seen"],
+            "sources": ioc["sources"],
+        })
+
+    # Hash match
+    if event.process_hash and event.process_hash in THREAT_INTEL["hashes"]:
+        ioc = THREAT_INTEL["hashes"][event.process_hash]
+        matches.append({
+            "indicator": event.process_hash,
+            "indicator_type": "hash",
+            "threat_type": ioc["threat_type"],
+            "confidence": ioc["confidence"],
+            "first_seen": ioc["first_seen"],
+            "last_seen": ioc["last_seen"],
+            "sources": ioc["sources"],
+        })
+
+    return matches
+
+# -----------------------------
+# Risk Scoring
+# -----------------------------
+def parse_time_safe(ts):
+    try:
+        return datetime.strptime(ts, TIME_FORMAT)
+    except Exception:
+        return None
+
+def compute_event_risk(event):
+    """
+    Score event risk based on:
+    - IOC match confidence
+    - Intel recency
+    - Asset criticality
+    - User sensitivity
+    - Event type and status (e.g., failed login vs process start)
+    """
+    base = 0.0
+
+    # Start from IOC matches
+    for m in event.matches:
+        conf = m["confidence"]  # 0 to 1
+        recency_boost = 0.0
+        last_seen = parse_time_safe(m["last_seen"])
+        if last_seen:
+            days_old = (datetime.utcnow() - last_seen).days
+            if days_old <= 7:
+                recency_boost = 0.3
+            elif days_old <= 30:
+                recency_boost = 0.1
+
+        # Indicator type weighting
+        typ = m["indicator_type"]
+        if typ == "hash":
+            typ_weight = 1.0
+        elif typ == "domain":
+            typ_weight = 0.8
+        else:  # ip
+            typ_weight = 0.7
+
+        # Threat type weighting (simplified)
+        threat_type = m["threat_type"]
+        if threat_type in ("ransomware", "C2"):
+            threat_weight = 1.0
+        elif threat_type in ("credential_stealer", "brute_force"):
+            threat_weight = 0.8
+        else:
+            threat_weight = 0.6
+
+        base += conf * typ_weight * threat_weight + recency_boost
+
+    # Asset criticality
+    crit = ASSET_CRITICALITY.get(event.asset, 0.5)
+    base *= (0.8 + crit)  # scale up with asset criticality
+
+    # User sensitivity
+    if event.username in HIGH_VALUE_USERS:
+        base *= 1.3
+
+    # Event-type adjustments
+    if event.event_type == "AUTH":
+        if event.status == "FAIL":
+            base *= 1.05
+        elif event.status == "SUCCESS":
+            base *= 1.2  # successful auth with IOC is more concerning
+    elif event.event_type == "PROCESS_START":
+        base *= 1.15
+
+    # Normalize / cap
+    if base > 10.0:
+        base = 10.0
+
+    event.base_risk = round(base, 2)
+
+# -----------------------------
+# Incident Grouping
+# -----------------------------
+class Incident:
+    def __init__(self, key):
+        self.key = key  # grouping key (e.g., src_ip or hash)
+        self.events = []
+        self.max_risk = 0.0
+        self.primary_threat_types = Counter()
+        self.primary_indicators = set()
+        self.assets = set()
+        self.users = set()
+        self.time_start = None
+        self.time_end = None
+
+    def add_event(self, event):
+        self.events.append(event)
+        if event.base_risk > self.max_risk:
+            self.max_risk = event.base_risk
+
+        for m in event.matches:
+            self.primary_threat_types[m["threat_type"]] += 1
+            self.primary_indicators.add(m["indicator"])
+
+        if event.asset:
+            self.assets.add(event.asset)
+        if event.username:
+            self.users.add(event.username)
+
+        if event.timestamp:
+            if not self.time_start or event.timestamp < self.time_start:
+                self.time_start = event.timestamp
+            if not self.time_end or event.timestamp > self.time_end:
+                self.time_end = event.timestamp
+
+    def to_dict(self):
+        return {
+            "group_key": self.key,
+            "max_risk": self.max_risk,
+            "primary_threat_types": list(self.primary_threat_types.keys()),
+            "primary_indicators": list(self.primary_indicators),
+            "assets": list(self.assets),
+            "users": list(self.users),
+            "time_start": self.time_start.strftime(TIME_FORMAT) if self.time_start else None,
+            "time_end": self.time_end.strftime(TIME_FORMAT) if self.time_end else None,
+            "event_count": len(self.events),
+            "events": [e.to_dict() for e in self.events],
+        }
+
+def group_incidents(events):
+    """
+    Simple but effective grouping:
+    - If event has a matched indicator, group by primary indicator (e.g., IP or hash)
+    - If no matches, ignore for this prototype
+    """
+    incidents_by_indicator = {}
+
+    for e in events:
+        if not e.matches:
+            continue
+        # For grouping, take the first matched indicator
+        key = e.matches[0]["indicator"]
+        if key not in incidents_by_indicator:
+            incidents_by_indicator[key] = Incident(key)
+        incidents_by_indicator[key].add_event(e)
+
+    return list(incidents_by_indicator.values())
+
+# -----------------------------
+# Response Playbooks
+# -----------------------------
+def recommend_actions(incident):
+    """
+    Suggest automated or semi-automated actions based on:
+    - Threat types involved
+    - Risk level
+    - Assets affected
+    """
+    actions = []
+    threat_types = set(incident.primary_threat_types.keys())
+    max_risk = incident.max_risk
+    assets = incident.assets
+
+    high_value_asset = any(a in ("AD-SERVER", "VPN-GATEWAY") for a in assets)
+
+    # Generic actions
+    if max_risk >= 7:
+        actions.append("Escalate to Tier-2 analyst immediately.")
+        actions.append("Create high-priority incident ticket with full context.")
+    elif max_risk >= 4:
+        actions.append("Queue for Tier-1 review within SLA.")
+        actions.append("Correlate with other alerts for same indicator or asset.")
+
+    # Threat-specific actions
+    if "ransomware" in threat_types:
+        actions.append("Isolate affected hosts from network.")
+        actions.append("Block associated hashes at EDR/AV level.")
+        actions.append("Initiate backup integrity verification for impacted assets.")
+
+    if "C2" in threat_types:
+        actions.append("Block outbound traffic to indicator IPs/domains on perimeter firewall.")
+        actions.append("Capture full packet logs for affected assets for 24 hours.")
+        actions.append("Initiate threat hunt for related C2 infrastructure.")
+
+    if "credential_stealer" in threat_types or "brute_force" in threat_types:
+        actions.append("Force password reset for impacted and related accounts.")
+        actions.append("Increase authentication logging and alert thresholds for targeted assets.")
+        actions.append("Review MFA status for all affected identities.")
+
+    if high_value_asset:
+        actions.append("Notify cyber lead / duty officer for situational awareness.")
+        actions.append("Cross-check against mission-critical operations schedule.")
+
+    # Deduplicate while preserving order
+    seen = set()
+    final_actions = []
+    for a in actions:
+        if a not in seen:
+            seen.add(a)
+            final_actions.append(a)
+
+    return final_actions
+
+# -----------------------------
+# Reporting
+# -----------------------------
+def generate_human_report(incidents):
+    print("\n================ THREAT AUTOMATION ANALYZER REPORT ================\n")
+    if not incidents:
+        print("No IOC-correlated events detected. Environment appears clean under current rules.\n")
+        return
+
+    incidents = sorted(incidents, key=lambda inc: inc.max_risk, reverse=True)
+
+    for i, inc in enumerate(incidents, start=1):
+        d = inc.to_dict()
+        actions = recommend_actions(inc)
+
+        print(f"--- Incident {i} ---")
+        print(f"Group Key (Indicator): {d['group_key']}")
+        print(f"Max Risk Score:       {d['max_risk']:.2f} / 10")
+        print(f"Primary Threat Types: {', '.join(d['primary_threat_types'])}")
+        print(f"Assets Involved:      {', '.join(d['assets']) if d['assets'] else 'N/A'}")
+        print(f"Users Involved:       {', '.join(d['users']) if d['users'] else 'N/A'}")
+        print(f"Time Window:          {d['time_start']}  →  {d['time_end']}")
+        print(f"Event Count:          {d['event_count']}\n")
+
+        print("Representative Events:")
+        for e in inc.events[:5]:
+            print(f"  [{e.timestamp.strftime(TIME_FORMAT) if e.timestamp else 'N/A'}] "
+                  f"{e.event_type} src={e.src_ip} dst={e.dst_ip} user={e.username} "
+                  f"asset={e.asset} status={e.status} risk={e.base_risk}")
+        print()
+
+        print("Recommended Actions:")
+        for a in actions:
+            print(f"  - {a}")
+        print("\n" + "-" * 64 + "\n")
+
+def save_json_report(incidents, path="threat_incident_report.json"):
+    data = []
+    for inc in incidents:
+        d = inc.to_dict()
+        d["recommended_actions"] = recommend_actions(inc)
+        data.append(d)
+
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"JSON report saved to: {path}")
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    print("MILITARY-STYLE THREAT AUTOMATION ANALYZER")
+    print("-----------------------------------------")
+    path = input("Enter path to JSONL event file: ").strip()
+    events = load_events(path)
+
+    if not events:
+        print("No events loaded. Exiting.")
+        return
+
+    # Match and score
+    for e in events:
+        e.matches = match_threat_intel(e)
+        if e.matches:
+            compute_event_risk(e)
+
+    # Filter to relevant (those with matches)
+    correlated_events = [e for e in events if e.matches]
+
+    if not correlated_events:
+        print("No events matched current threat intel.")
+        return
+
+    incidents = group_incidents(correlated_events)
+    generate_human_report(incidents)
+    save_json_report(incidents)
+
+if __name__ == "__main__":
+    main()
